@@ -4,6 +4,7 @@
   // --- Constants ---
 
   const STORAGE_KEY = 'pr-filter-bot-overrides';
+  const WHITESPACE_KEY = 'pr-filter-hide-whitespace';
 
   const KNOWN_BOTS = new Set([
     'github-actions',
@@ -28,11 +29,15 @@
 
   // --- State ---
 
-  let authors = new Map(); // username -> { isBot: boolean, count: number, elements: Element[] }
-  let activePreset = 'humans'; // 'humans' | 'all' | 'bots' | 'custom'
+  let authors = new Map();
+  let activePreset = 'humans';
   let panelExpanded = false;
   let panelEl = null;
-  let cachedOverrides = {}; // in-memory cache, synced with chrome.storage.local
+  let cachedOverrides = {};
+
+  let whitespaceHidden = true;
+  let whitespacePanelExpanded = true;
+  let linkInterceptionSetup = false;
 
   // --- Storage (chrome.storage.local instead of localStorage) ---
 
@@ -46,10 +51,62 @@
   }
 
   function initStorage(callback) {
-    chrome.storage.local.get([STORAGE_KEY], (result) => {
+    chrome.storage.local.get([STORAGE_KEY, WHITESPACE_KEY], (result) => {
       cachedOverrides = result[STORAGE_KEY] || {};
+      whitespaceHidden = result[WHITESPACE_KEY] !== false;
       callback();
     });
+  }
+
+  // --- Page detection ---
+
+  function isChangesPage() {
+    return /\/pull\/\d+\/changes/.test(window.location.pathname);
+  }
+
+  // --- Whitespace redirect ---
+
+  function handleWhitespaceRedirect() {
+    if (!isChangesPage()) return false;
+
+    const url = new URL(window.location.href);
+    if (whitespaceHidden && url.searchParams.get('w') !== '1') {
+      url.searchParams.set('w', '1');
+      window.location.replace(url.toString());
+      return true;
+    }
+    if (!whitespaceHidden && url.searchParams.get('w') === '1') {
+      url.searchParams.delete('w');
+      window.location.replace(url.toString());
+      return true;
+    }
+    return false;
+  }
+
+  // --- Link interception ---
+
+  function setupLinkInterception() {
+    if (linkInterceptionSetup) return;
+    linkInterceptionSetup = true;
+
+    document.addEventListener('click', (e) => {
+      const link = e.target.closest('a');
+      if (!link) return;
+
+      const href = link.getAttribute('href');
+      if (!href) return;
+
+      if (/\/pull\/\d+\/changes/.test(href)) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        const url = new URL(href, window.location.origin);
+        if (whitespaceHidden) {
+          url.searchParams.set('w', '1');
+        }
+        window.location.href = url.toString();
+      }
+    }, true);
   }
 
   // --- Bot detection ---
@@ -92,7 +149,6 @@
       const username = getAuthorFromComment(el);
       if (!username) continue;
 
-      // Skip the PR description (first comment) — always keep it visible
       if (isFirst) {
         isFirst = false;
         continue;
@@ -315,6 +371,32 @@
       .pr-filter-ctx-menu button:hover {
         background: #30363d;
       }
+
+      .pr-filter-ws-buttons {
+        display: flex;
+        gap: 6px;
+        padding: 10px 12px;
+      }
+      .pr-filter-ws-btn {
+        flex: 1;
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid #30363d;
+        background: #21262d;
+        color: #8b949e;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+      }
+      .pr-filter-ws-btn:hover {
+        border-color: #58a6ff;
+        color: #e6edf3;
+      }
+      .pr-filter-ws-btn.active {
+        background: #1f6feb;
+        border-color: #1f6feb;
+        color: #fff;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -428,6 +510,66 @@
     }
   }
 
+  // --- Whitespace Panel ---
+
+  function renderWhitespacePanel() {
+    if (!panelEl) {
+      panelEl = document.createElement('div');
+      panelEl.id = 'pr-filter-panel';
+      document.body.appendChild(panelEl);
+    }
+
+    if (!whitespacePanelExpanded) {
+      panelEl.innerHTML = `
+        <div id="pr-filter-pill">
+          <span>WS</span>
+          <span>${whitespaceHidden ? 'Hidden' : 'Visible'}</span>
+        </div>
+      `;
+      panelEl.querySelector('#pr-filter-pill').addEventListener('click', () => {
+        whitespacePanelExpanded = true;
+        renderWhitespacePanel();
+      });
+      return;
+    }
+
+    panelEl.innerHTML = `
+      <div id="pr-filter-expanded">
+        <div class="pr-filter-header">
+          <span>Hide whitespace changes</span>
+          <button id="pr-filter-collapse" title="Collapse">&minus;</button>
+        </div>
+        <div class="pr-filter-ws-buttons">
+          <button class="pr-filter-ws-btn ${whitespaceHidden ? 'active' : ''}" data-ws="hide">Yes</button>
+          <button class="pr-filter-ws-btn ${!whitespaceHidden ? 'active' : ''}" data-ws="show">No</button>
+        </div>
+      </div>
+    `;
+
+    panelEl.querySelector('#pr-filter-collapse').addEventListener('click', () => {
+      whitespacePanelExpanded = false;
+      renderWhitespacePanel();
+    });
+
+    for (const btn of panelEl.querySelectorAll('.pr-filter-ws-btn')) {
+      btn.addEventListener('click', () => {
+        const wantHide = btn.dataset.ws === 'hide';
+        if (wantHide === whitespaceHidden) return;
+
+        whitespaceHidden = wantHide;
+        chrome.storage.local.set({ [WHITESPACE_KEY]: wantHide });
+
+        const url = new URL(window.location.href);
+        if (wantHide) {
+          url.searchParams.set('w', '1');
+        } else {
+          url.searchParams.delete('w');
+        }
+        window.location.href = url.toString();
+      });
+    }
+  }
+
   // --- Context menu ---
 
   function showContextMenu(x, y, username) {
@@ -505,7 +647,10 @@
   // --- Init ---
 
   function reinit() {
-    // Re-run without resetting panel expanded state
+    if (isChangesPage()) {
+      renderWhitespacePanel();
+      return;
+    }
     scanComments();
     const visible = getVisibleAuthors();
     const counts = applyFilters(visible);
@@ -514,14 +659,23 @@
   }
 
   function init() {
-    // Remove any existing panel on SPA navigation
     const existing = document.getElementById('pr-filter-panel');
     if (existing) existing.remove();
     panelEl = null;
+
+    createStyles();
+    setupLinkInterception();
+
+    if (isChangesPage()) {
+      if (handleWhitespaceRedirect()) return;
+      whitespacePanelExpanded = false;
+      renderWhitespacePanel();
+      return;
+    }
+
     panelExpanded = false;
     activePreset = 'humans';
 
-    createStyles();
     scanComments();
     const visible = getVisibleAuthors();
     const counts = applyFilters(visible);
