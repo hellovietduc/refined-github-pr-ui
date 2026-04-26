@@ -31,6 +31,7 @@
 
   let authors = new Map();
   let activePreset = 'humans';
+  let customSelection = new Map();
   let panelExpanded = false;
   let panelEl = null;
   let cachedOverrides = {};
@@ -175,6 +176,13 @@
       if (activePreset === 'humans' && !data.isBot) visible.add(username);
       else if (activePreset === 'bots' && data.isBot) visible.add(username);
       else if (activePreset === 'all') visible.add(username);
+      else if (activePreset === 'custom') {
+        if (customSelection.has(username)) {
+          if (customSelection.get(username)) visible.add(username);
+        } else if (!data.isBot) {
+          visible.add(username);
+        }
+      }
     }
     return visible;
   }
@@ -197,6 +205,7 @@
 
   function applyPreset(preset) {
     activePreset = preset;
+    customSelection.clear();
     const visible = getVisibleAuthors();
     const counts = applyFilters(visible);
     renderPanel(counts, visible);
@@ -204,12 +213,12 @@
 
   function toggleAuthor() {
     activePreset = 'custom';
-    const visible = new Set();
     const checkboxes = panelEl.querySelectorAll('input[data-author]');
     for (const cb of checkboxes) {
-      if (cb.checked) visible.add(cb.dataset.author);
+      customSelection.set(cb.dataset.author, cb.checked);
     }
 
+    const visible = getVisibleAuthors();
     const counts = applyFilters(visible);
     renderPanel(counts, visible);
   }
@@ -316,16 +325,21 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 3px 0;
+        padding: 3px 6px;
+        margin: 0 -6px;
+        border-radius: 4px;
         position: relative;
+        cursor: pointer;
+      }
+      .pr-filter-author:hover {
+        background: #1c2128;
       }
       .pr-filter-author input[type="checkbox"] {
         margin: 0;
         cursor: pointer;
       }
-      .pr-filter-author label {
+      .pr-filter-author-info {
         flex: 1;
-        cursor: pointer;
         display: flex;
         justify-content: space-between;
       }
@@ -440,13 +454,13 @@
     const authorRow = (username, data) => {
       const checked = visibleAuthors.has(username) ? 'checked' : '';
       return `
-        <div class="pr-filter-author" data-ctx-author="${username}">
+        <label class="pr-filter-author" data-ctx-author="${username}">
           <input type="checkbox" data-author="${username}" ${checked}>
-          <label data-author-label="${username}">
+          <span class="pr-filter-author-info">
             <span>${username}</span>
             <span class="count">(${data.count})</span>
-          </label>
-        </div>
+          </span>
+        </label>
       `;
     };
 
@@ -675,6 +689,7 @@
 
     panelExpanded = false;
     activePreset = 'humans';
+    customSelection.clear();
 
     scanComments();
     const visible = getVisibleAuthors();
