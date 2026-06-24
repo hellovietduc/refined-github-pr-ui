@@ -20,12 +20,37 @@
     'coderabbit',
     'copilot',
     'linear',
+    'linear-code',
+    'claude',
     'mergify',
     'percy',
     'chromatic',
     'snyk',
     'sonarcloud',
   ]);
+
+  // --- Site detection ---
+  // The extension runs on both GitHub PR pages and Graphite's PR review UI
+  // (a client-rendered SPA). Selectors and navigation handling differ per site.
+
+  const SITE = location.hostname === 'app.graphite.com' ? 'graphite' : 'github';
+
+  const SELECTORS = {
+    github: {
+      // First timeline item is the PR description, not a comment — skip it.
+      skipFirst: true,
+      comments: '.timeline-comment, .review-comment, .js-timeline-item',
+      observeRoot: '.js-discussion, [data-target="diff-layout.mainContainer"]',
+    },
+    graphite: {
+      // The discussion list holds only real comments/events; nothing to skip.
+      skipFirst: false,
+      // CSS-module class: the "DiscussionItem_discussionItem__" prefix is stable,
+      // the trailing hash is not — match on the prefix.
+      discussionList: '[role="list"][aria-label="Discussion"]',
+      comments: ':scope > [class*="DiscussionItem_discussionItem__"]',
+    },
+  };
 
   // --- State ---
 
@@ -62,7 +87,16 @@
   // --- Page detection ---
 
   function isChangesPage() {
-    return /\/pull\/\d+\/changes/.test(window.location.pathname);
+    // GitHub-only: the "Files changed" tab where the whitespace toggle applies.
+    return SITE === 'github' && /\/pull\/\d+\/changes/.test(window.location.pathname);
+  }
+
+  function isPrPage() {
+    if (SITE === 'graphite') {
+      return /\/github\/pr\//.test(window.location.pathname);
+    }
+    // GitHub content script only matches /pull/ URLs already.
+    return true;
   }
 
   // --- Whitespace redirect ---
@@ -118,6 +152,7 @@
     if (overrides[username] === 'human') return false;
     if (username.endsWith('[bot]')) return true;
     if (username.endsWith('-app')) return true;
+    if (username.endsWith('-agent')) return true;
     if (username.includes('-actions')) return true;
     if (KNOWN_BOTS.has(username)) return true;
     return false;
@@ -126,6 +161,20 @@
   // --- Comment scanning ---
 
   function getAuthorFromComment(el) {
+    if (SITE === 'graphite') {
+      // The avatar's title attribute is the cleanest author token
+      // (handle for bots, display name for humans).
+      const avatar = el.querySelector('[class*="Avatar_avatar__"][title]');
+      if (avatar) return avatar.getAttribute('title').trim();
+      // Fallback: the leading text node of the discussion item header.
+      const header = el.querySelector('[class*="DiscussionItem_discussionItemHeader__"] span');
+      if (header && header.firstChild && header.firstChild.nodeType === 3) {
+        const text = header.firstChild.textContent.trim();
+        if (text) return text;
+      }
+      return null;
+    }
+
     const authorLink =
       el.querySelector('.author') ||
       el.querySelector('a.timeline-comment-header-text');
@@ -134,24 +183,25 @@
   }
 
   function getCommentElements() {
-    return [
-      ...document.querySelectorAll(
-        '.timeline-comment, .review-comment, .js-timeline-item'
-      ),
-    ];
+    if (SITE === 'graphite') {
+      const list = document.querySelector(SELECTORS.graphite.discussionList);
+      if (!list) return [];
+      return [...list.querySelectorAll(SELECTORS.graphite.comments)];
+    }
+    return [...document.querySelectorAll(SELECTORS.github.comments)];
   }
 
   function scanComments() {
     authors.clear();
     const elements = getCommentElements();
-    let isFirst = true;
+    let skipFirst = SELECTORS[SITE].skipFirst;
 
     for (const el of elements) {
       const username = getAuthorFromComment(el);
       if (!username) continue;
 
-      if (isFirst) {
-        isFirst = false;
+      if (skipFirst) {
+        skipFirst = false;
         continue;
       }
 
@@ -622,6 +672,14 @@
   // --- MutationObserver for lazy-loaded comments ---
 
   let observer = null;
+  let rescanTimer = null;
+
+  function rescanAndRender() {
+    scanComments();
+    const visible = getVisibleAuthors();
+    const counts = applyFilters(visible);
+    renderPanel(counts, visible);
+  }
 
   function setupObserver() {
     if (observer) {
@@ -629,7 +687,44 @@
       observer = null;
     }
 
-    const timeline = document.querySelector('.js-discussion, [data-target="diff-layout.mainContainer"]');
+    if (SITE === 'graphite') {
+      // Graphite renders the discussion asynchronously and re-renders on SPA
+      // navigation, so watch the body and debounce a full re-scan. Ignore
+      // mutations inside our own panel (otherwise renderPanel would loop) and
+      // only react to discussion-related changes.
+      const DISCUSSION_SEL = '[class*="DiscussionItem_discussionItem__"]';
+      observer = new MutationObserver((mutations) => {
+        if (!isPrPage()) return;
+
+        let relevant = false;
+        for (const mutation of mutations) {
+          if (panelEl && panelEl.contains(mutation.target)) continue;
+
+          const touched = [...mutation.addedNodes, ...mutation.removedNodes];
+          for (const node of touched) {
+            if (node.nodeType !== 1) continue;
+            if (
+              node.matches?.(DISCUSSION_SEL) ||
+              node.querySelector?.(DISCUSSION_SEL) ||
+              node.matches?.(SELECTORS.graphite.discussionList) ||
+              node.querySelector?.(SELECTORS.graphite.discussionList)
+            ) {
+              relevant = true;
+              break;
+            }
+          }
+          if (relevant) break;
+        }
+
+        if (!relevant) return;
+        clearTimeout(rescanTimer);
+        rescanTimer = setTimeout(rescanAndRender, 250);
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      return;
+    }
+
+    const timeline = document.querySelector(SELECTORS.github.observeRoot);
     if (!timeline) return;
 
     observer = new MutationObserver((mutations) => {
@@ -678,13 +773,19 @@
     panelEl = null;
 
     createStyles();
-    setupLinkInterception();
 
-    if (isChangesPage()) {
-      if (handleWhitespaceRedirect()) return;
-      whitespacePanelExpanded = false;
-      renderWhitespacePanel();
-      return;
+    // Graphite is matched broadly (SPA); only activate on PR pages.
+    if (!isPrPage()) return;
+
+    if (SITE === 'github') {
+      setupLinkInterception();
+
+      if (isChangesPage()) {
+        if (handleWhitespaceRedirect()) return;
+        whitespacePanelExpanded = false;
+        renderWhitespacePanel();
+        return;
+      }
     }
 
     panelExpanded = false;
@@ -710,4 +811,30 @@
   // Re-init on GitHub SPA navigation
   document.addEventListener('turbo:load', () => initStorage(init));
   document.addEventListener('pjax:end', () => initStorage(init));
+
+  // Re-init on Graphite SPA navigation (Next.js client-side routing emits no
+  // turbo/pjax events, so hook history + popstate and watch the path).
+  if (SITE === 'graphite') {
+    let lastPath = location.pathname;
+
+    const onLocationChange = () => {
+      if (location.pathname === lastPath) return;
+      lastPath = location.pathname;
+      initStorage(init);
+    };
+
+    const patch = (type) => {
+      const original = history[type];
+      history[type] = function () {
+        const result = original.apply(this, arguments);
+        window.dispatchEvent(new Event('graphite:locationchange'));
+        return result;
+      };
+    };
+    patch('pushState');
+    patch('replaceState');
+
+    window.addEventListener('popstate', onLocationChange);
+    window.addEventListener('graphite:locationchange', onLocationChange);
+  }
 })();
