@@ -136,11 +136,65 @@ world entirely.
   entry (alongside `content.js`).
 - Bump `version`.
 
+## DOM targeting & pill injection
+
+Graphite's markup uses hashed CSS-module class names (`StackViz_stackVizRow__Mip7l`,
+`Pill_pill__alWFZ`, …) whose trailing hash changes across Graphite builds. Match on
+the **stable class-name prefix** via `[class*="Prefix__"]` (the same convention the
+existing `content.js` already uses for `DiscussionItem_discussionItem__`), never on
+the full hashed class.
+
+Reference row structure (from a live stack; abbreviated):
+
+```html
+<a class="StackViz_stackVizRow__… StackViz_stackVizRowInteractive__…"
+   href="/github/pr/padlet/mozart/59232/%5B…%5D-title" aria-current="true|absent">
+  <div class="StackVizNode_stackViz_node__…"> … graph dots/lines … </div>
+  <div class="StackViz_stackVizRowContents__…">
+    <span class="Avatar_avatarContainer__…"> … </span>
+    <div class="…textEllipsis…"><span>#59232</span><span>title…</span></div>
+    <span class="…flexAlignCenter… …ui-xs… …textColorLowContrast…">   <!-- THREAD COUNT — do NOT touch -->
+      <svg …thread icon…></svg>5/6
+    </span>
+    <span class="…flexAlignCenter… styles_gap__xs__…">                 <!-- STATUS CONTAINER — target this -->
+      <div class="Pill_pill__…" data-size="xs" data-kind="negative"><span>Required checks failed</span></div>
+      <time datetime="…" class="StackViz_stackVizRowUpdatedTime__…">4m</time>
+    </span>
+  </div>
+  <div class="Surface_gdsSurface__ StackViz_currentRowActions__…"></div>
+</a>
+```
+
+Targeting algorithm, per stack:
+
+1. **Rows:** `document.querySelectorAll('a[class*="StackViz_stackVizRow__"]')`.
+   Only anchors with an `href` matching `^/github/pr/([^/]+)/([^/]+)/(\d+)` are PR
+   rows — capture `owner`, `repo`, `number` from those three groups. The **trunk
+   row** (`master (trunk)`) is a `div`, not an `a`, and has no matching href — it is
+   naturally skipped. The current row carries `aria-current="true"` (used only for
+   optional emphasis, not for selection).
+2. **Status container (the injection point):** within the row, find the
+   `[class*="Pill_pill__"]` element (`existingPill`); its **parent element** is the
+   status container span that holds the pill + the `<time>`. Disambiguation from the
+   look-alike thread-count span is unambiguous: the status container is the only one
+   that contains a `[class*="Pill_pill__"]` node. If a row has no `[class*="Pill_pill__"]`
+   (e.g. Graphite chose to render no pill), skip that row.
+3. **Injection:** to keep Graphite's exact pill geometry (padding, radius, font,
+   `data-size`), **clone `existingPill`** once per category pill to render. For each
+   clone: set its inner `<span>` text to the category label, set its `title` to the
+   underlying check name(s), and apply our color via an added class
+   (`rgpr-pill--red|amber|yellow`) — overriding `data-kind` styling. Remove the
+   original `existingPill`, and insert the clones (wrapped in a small inline-flex
+   `<span class="rgpr-pills">` with a gap) in its place — **before** the `<time>`
+   sibling so the timestamp stays put. When only one category applies, this yields a
+   single pill, visually equivalent to stock but relabeled/recolored.
+4. Cloning inherits whatever hashed `Pill_pill__…` class the current build uses, so
+   the injected pills stay style-consistent even after a Graphite rebuild; our color
+   classes are the only custom styling and come from an injected `<style>` block
+   (reusing the `createStyles()` pattern in `content.js`).
+
 ## Rendering, caching, lifecycle
 
-- **Row → PR mapping:** each row is an `<a href="/github/pr/{owner}/{repo}/{number}/…">`;
-  parse those segments. The current row has `aria-current="true"`. The trunk row
-  (`master (trunk)`) has no PR link and is skipped.
 - **Caching:** results keyed by PR `headSHA`, held in worker memory and mirrored to
   `chrome.storage.local` with a short TTL (~2 minutes). The content script's
   observer re-renders and SPA navigation therefore do **not** re-hit the API unless
@@ -148,12 +202,13 @@ world entirely.
   the worker resolves it as part of the GraphQL response and caches on it; the
   content script keys its request on `{owner,repo,number}` and the worker
   short-circuits on cached SHA/TTL.)
-- **Idempotent DOM update:** locate each row's pill node
-  (`[class*="Pill_pill__"]`), replace it with our rendered pill container, and tag
-  the row `data-rgpr-ci="<number>:<sha-or-token-of-state>"`. If Graphite re-renders
-  and wipes our pills, the `MutationObserver` re-applies from cache. Custom colors
-  come from an injected `<style>` block (reusing the existing style-injection
-  approach in `content.js`), with classes like `rgpr-pill--red|amber|yellow`.
+- **Idempotent DOM update:** after injecting, tag the status container
+  `data-rgpr-ci="<number>"` and store a state signature (e.g. joined category keys)
+  in `data-rgpr-sig`. On each observer pass, skip a row whose container already
+  carries the matching `data-rgpr-sig`; re-apply when the signature differs or when
+  Graphite has re-rendered the row and dropped our pills (the tag/clones are gone).
+  Guard the observer against reacting to our own mutations (ignore subtrees we just
+  wrote), mirroring the existing observer's self-mutation guard in `content.js`.
 - **Graceful degradation (never break the page):** if no token is set, the feature
   is disabled, or the API returns `401`/error/rate-limit, leave Graphite's original
   pills untouched. Errors are surfaced only in the options page (e.g. last-error
